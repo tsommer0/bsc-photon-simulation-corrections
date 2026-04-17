@@ -28,7 +28,7 @@ setup.py / pyproject.toml
 
 ## Input features and conditions
 
-**16 corrected shower shape variables** (e.g. r9, σiηiη, isolation sums, H/E, preshower energy).
+**16 corrected shower shape variables** (e.g. r9, σiηiη, isolation sums, H/E, preshower energy, etc.).
 
 **5 conditioning variables**: photon pT, supercluster η, φ, event ρ (energy density), and ΔR to the nearest muon.
 
@@ -76,6 +76,8 @@ Available OT methods (`--ot_method`):
 | `Sommer` | Custom weighted OT variant |
 | `WeightedOT` | Weighted balanced OT |
 
+Only `None`, `ExactOT` and `WeightedOT` are fully implemented and tested in detail for the thesis.
+
 ### 5. Inference
 The best checkpoint is loaded and the ODE `dx/dt = v(x, t, c)` is integrated from `t=0` (MC) to `t=1` (data) using the `dopri5` adaptive solver (`torchdiffeq.odeint`). The corrected features are then inverse-transformed back to physical units.
 
@@ -104,7 +106,7 @@ python cfm_experiment.py \
   --loss unweighted
 ```
 
-**Note:** `cfm_experiment.py` imports `flow_plotting_general_script` from the parent directory at runtime. That script is not part of this repository and must be present one level above.
+**Note:** `cfm_experiment.py` imports `flow_plotting_general_script` from the parent directory at runtime. That script is not part of this repository and must be present one level above. It has been written by Caio Daumann (PhD Student at RWTH Aachen University), the supervisor of this project.
 
 ---
 
@@ -122,4 +124,4 @@ The submit file transfers `cfm_experiment.py`, `10_submit_shell.sh`, and `basicM
 
 Core: `torch`, `torchdiffeq`, `numpy`, `pandas`, `awkward`, `hist`, `mplhep`, `matplotlib`, `xgboost`, `zuko`.
 
-The `customcfm` package in this repository provides the CFM and OT coupling implementations.
+The `customcfm` package in this repository provides the CFM and OT coupling implementations. It is a copy of Alexander Tongs Conditional Flow Matching library, extended by experimental variations of the original flow matching algorithms.

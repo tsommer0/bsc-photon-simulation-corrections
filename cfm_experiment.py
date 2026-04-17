@@ -1,6 +1,6 @@
 import os
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
-os.environ['PYTHONHASHSEED'] = str(42)
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"  # required for deterministic CUDA ops
+os.environ['PYTHONHASHSEED'] = str(42)           # fix Python hash seed for reproducibility
 
 import random
 import sys
@@ -13,9 +13,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset, Subset, RandomSampler
 from torchdiffeq import odeint
-import ot as pot
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
 import mplhep
 import hist
 import awkward as ak
@@ -30,7 +28,7 @@ from customcfm.conditional_flow_matching import (
 )
 plt.style.use([mplhep.style.CMS])
 
-# Import plot utilities from sibling directory
+# temporarily extend sys.path to import the plotting script from the parent directory
 _original_sys_path = sys.path.copy()
 try:
     _parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -45,7 +43,6 @@ from utils import (
     FiLMNet,
     MLP,
     lossplot_train,
-    add_corr_photonid_mva_run3_zmmg,
     add_mc_photonid_mva_run3_zmmg,
     add_data_photonid_mva_run3_zmmg,
     plot_correlation_matrices,
@@ -132,11 +129,6 @@ def safe_std(lst):
     return float(np.median(np.abs(x - np.median(x))))
 
 
-def safe_arithmetic_std_propagation(lst):
-    filtered = [x for x in lst if x is not None]
-    return np.sqrt(np.sum(np.array(filtered) ** 2)) / len(filtered) if filtered else None
-
-
 def safe_argmin(lst):
     filtered = [x for x in lst if x is not None]
     return int(np.argmin(filtered)) if filtered else None
@@ -220,11 +212,6 @@ def preprocess_data(
     variables_cms_names, variables_mc_names, conditions_names,
     isolation_variables, binary_position, region,
 ):
-    """
-    Drop NaNs, apply binary flags, filter region, log-transform,
-    iso scale/smooth, and standardize.  Returns preprocessed arrays
-    and the stats needed to invert the standardization later.
-    """
     data_df = data_df.dropna(subset=variables_cms_names + conditions_names).copy(deep=True)
     mc_df   = mc_df.dropna(subset=variables_mc_names   + conditions_names).copy(deep=True)
 
@@ -251,19 +238,13 @@ def preprocess_data(
     mc_inputs       = mc_df[variables_mc_names].values
     mc_conditions   = mc_df[conditions_names].values
 
-    # NOTE: variables_cms_names is a list; `list == str` evaluates to False,
-    # making this index a no-op — preserving identical behaviour to 9.py.
-    data_inputs[variables_cms_names == "photon_energyErr"] = np.log(
-        data_inputs[variables_cms_names == "photon_energyErr"]
-    )
-    mc_inputs[variables_mc_names == "photon_energyErr"] = np.log(
-        mc_inputs[variables_mc_names == "photon_energyErr"]
-    )
-
-    mc_inputs, data_inputs, iso_data, iso_mc = apply_scale_and_smooth(
+    # remap isolation variables to a smooth continuous scale; iso_mc stores the
+    # per-variable transform parameters needed to invert the transformation later
+    mc_inputs, data_inputs, _, iso_mc = apply_scale_and_smooth(
         mc_inputs, data_inputs, variables_cms_names, isolation_variables
     )
 
+    # standardize features and conditions using MC statistics
     inputs_mean     = np.mean(np.nan_to_num(mc_inputs),     axis=0)
     inputs_std      = np.std( np.nan_to_num(mc_inputs),     axis=0)
     condition_means = np.mean(np.nan_to_num(mc_conditions), axis=0)
@@ -279,8 +260,7 @@ def preprocess_data(
         data_inputs, mc_inputs,
         data_conditions, mc_conditions,
         inputs_mean, inputs_std,
-        condition_means, conditions_std,
-        iso_data, iso_mc,
+        iso_mc,
         conditions_names,
     )
 
@@ -317,8 +297,8 @@ def split_dataset(dataset, n, train_frac, val_frac, seed_mult, SEED):
 
 
 def split_dataset_area_of_interest(dataset, df, n, train_frac, val_frac, seed_mult, SEED):
-    """Like split_dataset, but val/test contain only photons with pt>25 and dR>0.4.
-    Photons excluded from val/test are added to the training set."""
+    """Val/test contain only photons with pt>25 and dR>0.4 (the signal-like region).
+    Photons outside this region are excluded from evaluation and added to training."""
     perm = torch.randperm(n, generator=torch.Generator().manual_seed(seed_mult * SEED))
 
     raw_val_idx  = perm[int(n * train_frac):int(n * (train_frac + val_frac))].tolist()
@@ -328,10 +308,10 @@ def split_dataset_area_of_interest(dataset, df, n, train_frac, val_frac, seed_mu
         row = df.iloc[i]
         return row["photon_pt"] > 25 and row["photon_muon_near_dR"] > 0.4
 
-    val_idx  = [i for i in raw_val_idx  if _is_relevant(i)]
-    test_idx = [i for i in raw_test_idx if _is_relevant(i)]
+    val_idx     = [i for i in raw_val_idx  if _is_relevant(i)]
+    test_idx    = [i for i in raw_test_idx if _is_relevant(i)]
     extra_train = [i for i in raw_test_idx + raw_val_idx if not _is_relevant(i)]
-    train_idx = extra_train + perm[:int(n * train_frac)].tolist()
+    train_idx   = extra_train + perm[:int(n * train_frac)].tolist()
 
     return (
         Subset(dataset, train_idx),
@@ -343,6 +323,7 @@ def split_dataset_area_of_interest(dataset, df, n, train_frac, val_frac, seed_mu
 
 def build_dataloaders(base_train, base_val, base_test,
                       target_train, target_val, batch_size, SEED):
+    # MC training loader uses replacement sampling so its length matches the data loader
     dl_base_train = DataLoader(
         base_train, batch_size=batch_size,
         sampler=RandomSampler(base_train, replacement=True, num_samples=len(base_train),
@@ -378,18 +359,22 @@ def _run_epoch(model, cfm, base_loader, target_loader,
         base_features, base_conditions, weights_batch = base_batch
         target_features, target_conditions            = target_batch
 
+        # normalize weights per batch to keep loss scale stable
         mean_weight   = weights_batch.mean().item()
         weights_batch = weights_batch / mean_weight
 
+        # concatenate features and conditions, then rescale for numerical stability in OT
         base   = torch.cat([base_features,   base_conditions],   dim=1) * ot_rescale
         target = torch.cat([target_features, target_conditions], dim=1) * ot_rescale
 
+        # sample interpolation time t, interpolated point xt, and target velocity ut
         t, xt, ut, weights_batch, _ = cfm.guided_sample_location_and_conditional_flow(
             base, target, y0=weights_batch
         )
         ut = ut[:, :feature_dim] / ot_rescale
         xt = xt / ot_rescale
 
+        # model predicts velocity on features only; conditions are passed separately
         vt = model(xt[:, :feature_dim], t, xt[:, feature_dim:])
 
         if loss_type == "weighted":
@@ -436,6 +421,7 @@ def train_model(model, cfm,
         scheduler.step(val_loss)
         end = time.time()
 
+        # checkpoint the model whenever validation loss improves
         if val_loss < best_val_loss:
             best_val_loss     = val_loss
             best_val_epoch    = epoch + 1
@@ -464,11 +450,8 @@ def train_model(model, cfm,
 # ---------------------------------------------------------------------------
 
 def run_inference(model, dl_base_test, device):
-    """ODE-integrate the flow over the full test set.
-    Returns corrected_features tensor and trajectory from the first batch."""
     model.eval()
     corrected_features = None
-    traj_plot = None
 
     with torch.no_grad():
         for batch_mc in dl_base_test:
@@ -482,73 +465,18 @@ def run_inference(model, dl_base_test, device):
                     raise RuntimeError(f"ODE returned NaN at t={t.item():.4f}")
                 return v.unsqueeze(1)
 
+            # integrate the learned vector field from t=0 (MC) to t=1 (data)
             t_span = torch.linspace(0, 1, 100, device=device)
             traj   = odeint(ode_func, batch_features_mc.unsqueeze(1), t_span,
                             atol=1e-7, rtol=1e-4, method="dopri5")
-            batch_out = traj[-1].squeeze(1)
-
-            if traj_plot is None:
-                traj_plot = traj
+            batch_out = traj[-1].squeeze(1)  # corrected features at t=1
 
             corrected_features = (
                 batch_out if corrected_features is None
                 else torch.cat([corrected_features, batch_out], dim=0)
             )
 
-    return corrected_features, traj_plot
-
-
-# ---------------------------------------------------------------------------
-# EMD calculation
-# ---------------------------------------------------------------------------
-
-def _emd(x0, x1):
-    a = torch.full((x0.shape[0],), 1.0 / x0.shape[0], device=x0.device)
-    b = torch.full((x1.shape[0],), 1.0 / x1.shape[0], device=x1.device)
-    M = pot.dist(x0.reshape(x0.shape[0], -1), x1.reshape(x1.shape[0], -1))
-    return pot.emd2(a, b, M, numItermax=100_000_000)
-
-
-def compute_all_emds(corrected_features, mc_inputs_np, data_inputs_np,
-                     base_test_indices, target_test_indices,
-                     mc_df_test, data_df_test, region, device):
-    """Returns six EMD values (None where not applicable to the region)."""
-    print("Starting EMD calculation...")
-    x1 = torch.tensor(data_inputs_np[target_test_indices], dtype=torch.float32, device=device)
-    x0 = torch.tensor(mc_inputs_np[base_test_indices],     dtype=torch.float32, device=device)
-
-    EMD_mc_all = EMD_corr_all = None
-    EMD_mc_barrel = EMD_corr_barrel = None
-    EMD_mc_endcap = EMD_corr_endcap = None
-
-    if region == "all":
-        b_data = np.abs(data_df_test["photon_ScEta"].values) < 1.442
-        e_data = np.abs(data_df_test["photon_ScEta"].values) > 1.566
-        b_mc   = np.abs(mc_df_test["photon_ScEta"].values)   < 1.442
-        e_mc   = np.abs(mc_df_test["photon_ScEta"].values)   > 1.566
-
-        for label, x0i, xi_c, x1i in [
-            ("all",    x0,         corrected_features,         x1),
-            ("barrel", x0[b_mc],   corrected_features[b_mc],   x1[b_data]),
-            ("endcap", x0[e_mc],   corrected_features[e_mc],   x1[e_data]),
-        ]:
-            print(f"  EMD {label}: {x0i.shape}, {x1i.shape}")
-            emd_mc, emd_corr = _emd(x0i, x1i), _emd(xi_c, x1i)
-            if label == "all":
-                EMD_mc_all,    EMD_corr_all    = emd_mc, emd_corr
-            elif label == "barrel":
-                EMD_mc_barrel, EMD_corr_barrel = emd_mc, emd_corr
-            else:
-                EMD_mc_endcap, EMD_corr_endcap = emd_mc, emd_corr
-
-    elif region == "barrel":
-        EMD_mc_barrel,  EMD_corr_barrel  = _emd(x0, x1), _emd(corrected_features, x1)
-    elif region == "endcap":
-        EMD_mc_endcap,  EMD_corr_endcap  = _emd(x0, x1), _emd(corrected_features, x1)
-
-    return (EMD_mc_all, EMD_corr_all,
-            EMD_mc_barrel, EMD_corr_barrel,
-            EMD_mc_endcap, EMD_corr_endcap)
+    return corrected_features
 
 
 # ---------------------------------------------------------------------------
@@ -644,11 +572,6 @@ def _update_tracker(tracker, entry, region, result):
 def plot_all_variables(variables_mc_names, variables_cms_names,
                        data_df_test, mc_df_test,
                        region, outdir, total_lumi):
-    """
-    Plot every variable for the target region.
-    For region=='all', also produces barrel and endcap sub-plots.
-    Returns (goodness_list, tracker_dict).
-    """
     tracker = {f"{m}_{s}_{r}": None
                for m in ("mva", "energyErr")
                for s in ("mc", "corr")
@@ -699,63 +622,6 @@ def plot_all_variables(variables_mc_names, variables_cms_names,
 
 
 # ---------------------------------------------------------------------------
-# Trajectory plotting  (defined for completeness; not called from main)
-# ---------------------------------------------------------------------------
-
-def plot_trajectories(cfm, variables_cms_names, target_dataset_test, base_dataset_test,
-                      traj, inputs_mean, inputs_std, outdir,
-                      matching_batch=32, matching_batch_visual=128):
-    with torch.no_grad():
-        N = 256
-        colors = np.zeros((N, 4))
-        colors[:, :3] = np.array([0, 1, 0])
-        colors[:, 3]  = np.linspace(0, 1, N)
-        green_alpha_cmap = ListedColormap(colors)
-
-        n_tail   = len(traj)
-        tail_idx = range(-1, -n_tail - 1, -1)
-
-        f_data = torch.stack([target_dataset_test[i][0] for i in tail_idx])
-        c_data = torch.stack([target_dataset_test[i][1] for i in tail_idx])
-        f_mc   = torch.stack([base_dataset_test[i][0]   for i in tail_idx])
-        c_mc   = torch.stack([base_dataset_test[i][1]   for i in tail_idx])
-        w_mc   = torch.stack([base_dataset_test[i][2]   for i in tail_idx])
-
-        mc   = torch.cat([f_mc,   c_mc],   dim=1) * 1e-2
-        data = torch.cat([f_data, c_data], dim=1) * 1e-2
-        mc, data, ut, _, _ = cfm.guided_sample_location_and_conditional_flow(
-            mc[:matching_batch], data[:matching_batch], y0=w_mc[:matching_batch]
-        )
-        ut     = ut[:, :f_data.shape[1]].detach().cpu().numpy() / 1e-2
-        f_data = f_data.detach().cpu().numpy() * inputs_std + inputs_mean
-        f_mc   = f_mc.detach().cpu().numpy()   * inputs_std + inputs_mean
-        traj   = traj.squeeze(2).detach().cpu().numpy() * inputs_std + inputs_mean
-
-        outdir = os.path.join(outdir, "trajectories")
-        os.makedirs(outdir, exist_ok=True)
-        for i, fi in enumerate(variables_cms_names):
-            for j, fj in enumerate(variables_cms_names):
-                if i >= j:
-                    continue
-                plt.title("CFM Trajectory")
-                plt.xlabel(fi); plt.ylabel(fj)
-                h, xe, ye = np.histogram2d(f_data[:, i], f_data[:, j], bins=1000, density=True)
-                plt.xlim(inputs_mean[i] - 5*inputs_std[i], inputs_mean[i] + 5*inputs_std[i])
-                plt.ylim(inputs_mean[j] - 5*inputs_std[j], inputs_mean[j] + 5*inputs_std[j])
-                plt.imshow(h.T, origin="lower", extent=[xe[0], xe[-1], ye[0], ye[-1]],
-                           aspect="auto", cmap=green_alpha_cmap, label="Data Density")
-                plt.scatter(traj[0,  :matching_batch_visual, i], traj[0,  :matching_batch_visual, j],
-                            s=10, alpha=0.3, c="blue", label="Simulation")
-                plt.scatter(traj[:,  :matching_batch_visual, i], traj[:,  :matching_batch_visual, j],
-                            s=0.2, alpha=0.15, c="olive")
-                plt.scatter(traj[-1, :matching_batch_visual, i], traj[-1, :matching_batch_visual, j],
-                            s=4, alpha=0.4, c="green", label="Flow")
-                plt.legend(); plt.xticks([]); plt.yticks([])
-                plt.savefig(os.path.join(outdir, f"trajectory_{fi}_{fj}.png"), dpi=300)
-                plt.close()
-
-
-# ---------------------------------------------------------------------------
 # Summary writing
 # ---------------------------------------------------------------------------
 
@@ -799,10 +665,6 @@ def _latex_header(hidden_dim, depth, ot_method, sigma, batch_size):
 
 
 def write_aggregate_summary(outdir0, start_time, args, metric_lists):
-    """
-    Write the multi-seed aggregate summary with LaTeX tables.
-    `metric_lists` maps metric name -> Python list of per-seed values.
-    """
     def s(key):
         return safe_mean(metric_lists[key]), safe_std(metric_lists[key])
 
@@ -842,10 +704,9 @@ def write_aggregate_summary(outdir0, start_time, args, metric_lists):
     opt_err_ee  = safe_argmin(rel_improve("energyErr_corr_ee",  "energyErr_mc_ee"))
 
     hdr = _latex_header(args.hidden_dim, args.depth, args.ot_method, args.sigma, args.batch_size)
-    ml  = metric_lists
 
     def _at(key, idx):
-        return ml[key][idx] if idx is not None else float("nan")
+        return metric_lists[key][idx] if idx is not None else float("nan")
 
     with open(os.path.join(outdir0, f"{start_time}.txt"), "w") as f:
         f.write(
@@ -878,7 +739,6 @@ def write_aggregate_summary(outdir0, start_time, args, metric_lists):
         else:
             f.write("Endcap Min Gen MVA same as Endcap Min Gen EMD: N/A\n")
 
-        # Average performance table
         f.write("\n\nLatex table average performance:\n")
         f.write(
             hdr + "    &   MVA   &   "
@@ -895,7 +755,6 @@ def write_aggregate_summary(outdir0, start_time, args, metric_lists):
             f"{energyErr_mc_ee:.2f} ± {energyErr_mc_ee_std:.2f}    &  {energyErr_corr_ee:.2f} ± {energyErr_corr_ee_std:.2f} \\\\\n\\hline\n"
         )
 
-        # Per-focus optimal tables
         focus_configs = [
             ("EB+EE", opt_mva_all, opt_emd_all, opt_err_all),
             ("EB",    opt_mva_eb,  opt_emd_eb,  opt_err_eb),
@@ -935,17 +794,17 @@ def main(args=None, SEED=42):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device =", device)
 
-    # --- configuration ---
     year        = "2022_2023_2024_pure_rw"
     total_lumi  = 108.96
     train_frac  = 0.68
     val_frac    = 0.14
     n_epochs    = 1000
     scheduler_patience  = 7
-    early_stop_patience = scheduler_patience * 2+1
+    early_stop_patience = scheduler_patience * 2 + 1
     lr          = 1e-3
     ot_rescale  = 1e-2
-    area_of_interest = True    # val/test contain only pt>25 & dR>0.4 photons; EMD disabled
+    # when True, val/test sets are restricted to signal-like photons (pt>25, dR>0.4)
+    area_of_interest = True
 
     if args.binary_position not in ("True", "False"):
         raise ValueError("binary_position must be 'True' or 'False'")
@@ -962,7 +821,6 @@ def main(args=None, SEED=42):
     if binary_position:
         method += "_binary"
 
-    # --- model & optimiser ---
     model = build_model(args.nn_method, feature_dim, cond_dim,
                         args.hidden_dim, args.depth, device)
     cfm   = build_cfm(args.ot_method, args.sigma)
@@ -972,7 +830,6 @@ def main(args=None, SEED=42):
         optimizer, mode="min", factor=0.5, patience=scheduler_patience,
     )
 
-    # --- output directory ---
     print(time.strftime("%Y-%m-%d %H:%M"))
     outdir0 = (
         f"/home/home1/institut_3a/tsommer/bsc-sommer-project/caios_dnf/CFM/"
@@ -984,15 +841,13 @@ def main(args=None, SEED=42):
     outdir = os.path.join(outdir0, start_time)
     os.makedirs(outdir, exist_ok=True)
 
-    # --- data ---
     data_df, mc_df = load_data(year)
     (
         data_df, mc_df,
         data_inputs, mc_inputs,
         data_conditions, mc_conditions,
         inputs_mean, inputs_std,
-        condition_means, conditions_std,
-        iso_data, iso_mc,
+        iso_mc,
         conditions_names,
     ) = preprocess_data(
         data_df, mc_df,
@@ -1013,20 +868,20 @@ def main(args=None, SEED=42):
 
     if area_of_interest:
         (base_train,   base_val,   base_test,
-         base_train_idx, _base_val_idx, base_test_idx) = split_dataset_area_of_interest(
+         _, _, base_test_idx) = split_dataset_area_of_interest(
             base_dataset, mc_df, n_base, train_frac, val_frac, 42, SEED
         )
         (target_train, target_val, target_test,
-         target_train_idx, _target_val_idx, target_test_idx) = split_dataset_area_of_interest(
+         _, _, target_test_idx) = split_dataset_area_of_interest(
             target_dataset, data_df, n_target, train_frac, val_frac, 43, SEED
         )
     else:
         (base_train,   base_val,   base_test,
-         base_train_idx, _base_val_idx, base_test_idx) = split_dataset(
+         _, _, base_test_idx) = split_dataset(
             base_dataset, n_base, train_frac, val_frac, 42, SEED
         )
         (target_train, target_val, target_test,
-         target_train_idx, _target_val_idx, target_test_idx) = split_dataset(
+         _, _, target_test_idx) = split_dataset(
             target_dataset, n_target, train_frac, val_frac, 43, SEED
         )
 
@@ -1046,7 +901,6 @@ def main(args=None, SEED=42):
         target_train, target_val, args.batch_size, SEED
     )
 
-    # --- training ---
     train_model(
         model, cfm,
         dl_base_train, dl_base_val,
@@ -1056,30 +910,16 @@ def main(args=None, SEED=42):
         n_epochs, early_stop_patience, outdir,
     )
 
-    # --- inference ---
     model.load_state_dict(torch.load(os.path.join(outdir, "best_model.pth")))
-    corrected_features, _ = run_inference(model, dl_base_test, device)
+    corrected_features = run_inference(model, dl_base_test, device)
 
-    # --- optional EMD ---
+    # EMD calculation is disabled; placeholders kept for the summary writer
     EMD_mc_all = EMD_corr_all = None
     EMD_mc_barrel = EMD_corr_barrel = None
     EMD_mc_endcap = EMD_corr_endcap = None
 
-    if False:  # EMD disabled; area_of_interest only affects the data split
-        (EMD_mc_all, EMD_corr_all,
-         EMD_mc_barrel, EMD_corr_barrel,
-         EMD_mc_endcap, EMD_corr_endcap) = compute_all_emds(
-            corrected_features, mc_inputs, data_inputs,
-            base_test_idx, target_test_idx,
-            mc_df_test, data_df_test, args.region, device,
-        )
-
-    # --- invert standardization & iso transforms ---
+    # invert standardization and iso transforms to recover physical units
     corrected_np = corrected_features.detach().cpu().numpy() * inputs_std + inputs_mean
-    # NOTE: same list-comparison no-op as 9.py (preserving identical behaviour)
-    corrected_np[variables_cms_names == "photon_energyErr"] = np.exp(
-        corrected_np[variables_cms_names == "photon_energyErr"]
-    )
     corrected_np = undo_apply_scale_and_smooth(
         corrected_np, iso_mc, variables_cms_names, ISOLATION_VARIABLES
     )
@@ -1089,7 +929,6 @@ def main(args=None, SEED=42):
     print("  barrel:", (mc_df_test["photon_ScEta"].abs() < 1.442).sum(),
           "  endcap:", (mc_df_test["photon_ScEta"].abs() > 1.566).sum())
 
-    # --- correlation matrices ---
     if args.region == "barrel":
         var_list_barrel = [x for x in variables_cms_names
                            if x not in ("photon_esEffSigmaRR", "photon_esEnergyOverRawE")]
@@ -1108,12 +947,10 @@ def main(args=None, SEED=42):
         path=f"{outdir}/correlation_matrices/",
     )
 
-    # --- MVA ---
     compute_mva(mc_df_test, data_df_test, variables_cms_names, variables_mc_names)
     variables_mc_names  = variables_mc_names  + ["raw_mva"]
     variables_cms_names = variables_cms_names + ["mva"]
 
-    # --- plots ---
     goodness, tracker = plot_all_variables(
         variables_mc_names, variables_cms_names,
         data_df_test, mc_df_test,
@@ -1171,15 +1008,16 @@ if __name__ == "__main__":
     metric_lists = {k: [] for k in METRIC_KEYS}
     outdir0 = None
 
+    # run full training and evaluation independently for each seed
     for seed in SEEDS:
         result = main(args=args, SEED=seed)
         outdir0 = result[0]
         for i, key in enumerate(METRIC_KEYS):
             metric_lists[key].append(result[2 + i])
 
+    # write median ± MAD summary and LaTeX tables across all seeds
     write_aggregate_summary(outdir0, start_time, args, metric_lists)
 
-    # Append one-line performance record
     perf_path = "/home/home1/institut_3a/tsommer/bsc-sommer-project/performance_of_interest_df.txt"
     base_cols = (f"{args.ot_method}, {args.loss}, {args.sigma}, {args.batch_size}, "
                  f"{args.depth}, {args.hidden_dim}")

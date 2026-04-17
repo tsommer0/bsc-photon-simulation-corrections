@@ -1,6 +1,6 @@
 executable = 10_submit_shell.sh
 
-transfer_input_files = 10_submit_shell.sh, 10.py, basicMamba.sh
+transfer_input_files = 10_submit_shell.sh, cfm_experiment.py, basicMamba.sh
 
 # an shell weitergereichte Argumente
 arguments = --nn_method $(nn_method) --ot_method $(ot_method) --region $(region) --depth $(depth) --hidden_dim $(hidden_dim) --batch_size $(batch_size) --binary_position $(binary_position) --loss $(loss)
